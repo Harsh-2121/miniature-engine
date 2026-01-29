@@ -21,9 +21,14 @@ class Room {
         this.maxUsers = 50;
     }
 
-    addUser(username, ws) {
+    addUser(username) {
         if (this.users.length >= this.maxUsers) return false;
-        if (this.users.includes(username)) return true;
+        
+        // Check if username already exists (case-insensitive)
+        const normalizedUsers = this.users.map(u => u.toLowerCase());
+        if (normalizedUsers.includes(username.toLowerCase())) {
+            return false;
+        }
         
         this.users.push(username);
         return true;
@@ -33,13 +38,14 @@ class Room {
         this.users = this.users.filter(u => u !== username);
         delete this.cursors[username];
         
-        // If room becomes empty and it's not public, clean it up after delay
+        // If room becomes empty and it's not public, mark for cleanup
         if (this.users.length === 0 && !this.isPublic) {
             setTimeout(() => {
                 if (this.users.length === 0) {
                     rooms.delete(this.id);
+                    console.log(`Cleaned up empty private room: ${this.id}`);
                 }
-            }, 300000); // Clean up after 5 minutes of being empty
+            }, 300000); // 5 minutes
         }
     }
 
@@ -71,6 +77,7 @@ wss.on("connection", (ws) => {
     ws.on("message", (message) => {
         try {
             const data = JSON.parse(message);
+            console.log(`Received ${data.type} from ${currentUser || 'new user'}`);
 
             switch (data.type) {
                 // === ROOM MANAGEMENT ===
@@ -97,7 +104,7 @@ wss.on("connection", (ws) => {
                         user: data.user,
                         x: data.x,
                         y: data.y
-                    });
+                    }, ws);
                     break;
 
                 case "MOVE_CARD":
@@ -137,7 +144,7 @@ wss.on("connection", (ws) => {
 
                 case "CHAT":
                     const chatRoom = rooms.get(currentRoomId);
-                    if (chatRoom) {
+                    if (chatRoom && data.user && data.text) {
                         const msg = {
                             user: data.user,
                             text: data.text,
@@ -155,13 +162,13 @@ wss.on("connection", (ws) => {
                         broadcastToRoom(currentRoomId, {
                             type: "CHAT",
                             ...msg
-                        });
+                        }, ws);
                     }
                     break;
 
                 case "ADD_CARD":
                     const addCardRoom = rooms.get(currentRoomId);
-                    if (addCardRoom) {
+                    if (addCardRoom && data.card) {
                         const card = {
                             id: crypto.randomUUID(),
                             user: data.card.user,
@@ -188,39 +195,53 @@ wss.on("connection", (ws) => {
 
                 // === USER MANAGEMENT ===
                 case "JOIN":
-                    currentUser = data.user;
-                    const joinRoom = rooms.get(currentRoomId);
-                    
-                    // Handle duplicate usernames in room
-                    let finalUsername = currentUser;
-                    let counter = 1;
-                    while (joinRoom.users.includes(finalUsername)) {
-                        finalUsername = `${currentUser}(${counter})`;
-                        counter++;
-                    }
-                    currentUser = finalUsername;
-
-                    if (joinRoom.addUser(currentUser)) {
-                        clients.set(ws, { user: currentUser, roomId: currentRoomId });
+                    // This is for backward compatibility
+                    if (!currentUser) {
+                        currentUser = data.user;
+                        const joinRoom = rooms.get(currentRoomId);
                         
-                        // Send initial room state
-                        ws.send(JSON.stringify({
-                            type: "ROOM_JOINED",
-                            room: joinRoom.toJSON(),
-                            chatHistory: joinRoom.chatMessages.slice(-50),
-                            user: currentUser
-                        }));
+                        if (joinRoom) {
+                            // Generate unique username if needed
+                            let finalUsername = currentUser;
+                            let counter = 1;
+                            while (!joinRoom.addUser(finalUsername)) {
+                                finalUsername = `${currentUser}(${counter})`;
+                                counter++;
+                                if (counter > 100) {
+                                    ws.send(JSON.stringify({
+                                        type: "ERROR",
+                                        message: "Could not find unique username",
+                                        source: "join"
+                                    }));
+                                    return;
+                                }
+                            }
+                            currentUser = finalUsername;
 
-                        // Notify others in room
-                        broadcastToRoom(currentRoomId, {
-                            type: "USER_JOINED",
-                            user: currentUser,
-                            roomId: currentRoomId
-                        }, ws);
+                            clients.set(ws, { user: currentUser, roomId: currentRoomId });
+                            
+                            // Send initial room state
+                            ws.send(JSON.stringify({
+                                type: "ROOM_JOINED",
+                                room: joinRoom.toJSON(),
+                                chatHistory: joinRoom.chatMessages.slice(-50),
+                                user: currentUser
+                            }));
 
-                        broadcastRoomState(currentRoomId);
+                            // Notify others in room
+                            broadcastToRoom(currentRoomId, {
+                                type: "USER_JOINED",
+                                user: currentUser,
+                                roomId: currentRoomId
+                            }, ws);
+
+                            broadcastRoomState(currentRoomId);
+                        }
                     }
                     break;
+                    
+                default:
+                    console.log(`Unknown message type: ${data.type}`);
             }
 
         } catch (error) {
@@ -233,6 +254,7 @@ wss.on("connection", (ws) => {
     });
 
     ws.on("close", () => {
+        console.log(`Client disconnected: ${currentUser || 'unknown'}`);
         if (currentUser && currentRoomId) {
             const room = rooms.get(currentRoomId);
             if (room) {
@@ -261,7 +283,8 @@ wss.on("connection", (ws) => {
         if (!room) {
             ws.send(JSON.stringify({
                 type: "ERROR",
-                message: "Room not found"
+                message: "Room not found",
+                source: "join"
             }));
             return;
         }
@@ -269,7 +292,8 @@ wss.on("connection", (ws) => {
         if (!room.isPublic && room.password && room.password !== password) {
             ws.send(JSON.stringify({
                 type: "ERROR",
-                message: "Incorrect password"
+                message: "Incorrect password",
+                source: "join"
             }));
             return;
         }
@@ -283,56 +307,38 @@ wss.on("connection", (ws) => {
                     type: "USER_LEFT",
                     user: currentUser,
                     roomId: currentRoomId
-                });
+                }, ws);
                 broadcastRoomState(currentRoomId);
             }
         }
 
         // Join new room
         currentRoomId = roomId;
-        clients.set(ws, { user: currentUser, roomId: currentRoomId });
-
-        if (currentUser && !room.users.includes(currentUser)) {
-            room.addUser(currentUser);
-        }
-
+        
         ws.send(JSON.stringify({
             type: "ROOM_JOINED",
             room: room.toJSON(),
             chatHistory: room.chatMessages.slice(-50),
-            user: currentUser
+            user: currentUser || data.user
         }));
 
-        // Notify room
-        broadcastToRoom(roomId, {
-            type: "USER_JOINED",
-            user: currentUser,
-            roomId: roomId
-        }, ws);
-
-        broadcastRoomState(roomId);
+        // Store client info
+        clients.set(ws, { user: currentUser, roomId: currentRoomId });
     }
 
     function handleCreateRoom(ws, data) {
-        if (!currentUser) {
-            ws.send(JSON.stringify({
-                type: "ERROR",
-                message: "You must join first"
-            }));
-            return;
-        }
-
         const roomId = crypto.randomUUID().slice(0, 8);
         const roomName = data.name || "New Room";
         const isPublic = data.isPublic !== false;
         const password = data.password || null;
 
-        const newRoom = new Room(roomId, roomName, isPublic, currentUser);
+        const newRoom = new Room(roomId, roomName, isPublic, data.user || "Anonymous");
         if (password) {
             newRoom.password = password;
         }
 
         rooms.set(roomId, newRoom);
+        console.log(`Room created: ${roomId} by ${data.user || 'anonymous'}`);
 
         ws.send(JSON.stringify({
             type: "ROOM_CREATED",
@@ -371,7 +377,7 @@ wss.on("connection", (ws) => {
                     type: "USER_LEFT",
                     user: currentUser,
                     roomId: currentRoomId
-                });
+                }, ws);
                 broadcastRoomState(currentRoomId);
             }
 
@@ -386,9 +392,13 @@ wss.on("connection", (ws) => {
 
 function broadcastToRoom(roomId, message, excludeWs = null) {
     const room = rooms.get(roomId);
-    if (!room) return;
+    if (!room) {
+        console.log(`Room ${roomId} not found for broadcast`);
+        return;
+    }
 
     const payload = JSON.stringify(message);
+    let sentCount = 0;
     
     wss.clients.forEach(client => {
         const clientData = clients.get(client);
@@ -397,8 +407,11 @@ function broadcastToRoom(roomId, message, excludeWs = null) {
             clientData.roomId === roomId &&
             client !== excludeWs) {
             client.send(payload);
+            sentCount++;
         }
     });
+    
+    console.log(`Broadcast ${message.type} to ${sentCount} clients in room ${roomId}`);
 }
 
 function broadcastRoomState(roomId) {
@@ -415,16 +428,8 @@ function broadcastRoomState(roomId) {
 setInterval(() => {
     for (const [roomId, room] of rooms) {
         if (roomId !== "public" && !room.isPublic && room.users.length === 0) {
-            // Check if room has been empty for more than 5 minutes
-            const timeSinceEmpty = Date.now() - Math.max(
-                ...room.users.map(u => u.lastSeen || 0),
-                room.createdAt
-            );
-            
-            if (timeSinceEmpty > 300000) { // 5 minutes
-                rooms.delete(roomId);
-                console.log(`Cleaned up empty room: ${roomId}`);
-            }
+            rooms.delete(roomId);
+            console.log(`Cleaned up empty private room: ${roomId}`);
         }
     }
 }, 60000); // Check every minute
